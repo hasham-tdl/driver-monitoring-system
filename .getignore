@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environments
+env/
+venv/
+.conda/
+.venv/
+
+# Models (VERY IMPORTANT)
+models/*.dat
+models/*.pt
+
+# Videos
+videos/
+
+# OS
+.DS_Store
+Thumbs.db
