@@ -66,7 +66,7 @@ app.py
 |    |-- smoking_detector.py
 |    |-- phone_detector.py
 |
-+-- models/        (local only, not committed)
++-- models/       
 +-- videos/
 +-- README.md
 
@@ -207,3 +207,4 @@ Contributions are welcome.
 For major changes, please open an issue first.
 
 =====================================================================
+
