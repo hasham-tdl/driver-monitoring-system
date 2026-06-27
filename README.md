@@ -1,210 +1,178 @@
-=====================================================================
-                         DRIVER MONITORING SYSTEM
-=====================================================================
+# Driver Monitoring System (v1)
 
-Real-time driver behavior monitoring using Computer Vision & Deep Learning
+**Detect drowsiness, phone use, and smoking in real time on a $35 Raspberry Pi — because driver inattention kills and dedicated ADAS hardware costs thousands.**
 
-Built with:
-Python | OpenCV | Kivy | YOLOv8
+> **v2 is a from-scratch rebuild with significantly higher accuracy** (97.8% eye-state CNN, ground-truth regression suite). See [dms2 / v2](https://github.com/hasham-tdl/v2).
 
----------------------------------------------------------------------
-OVERVIEW
----------------------------------------------------------------------
+## What It Does
 
-This Driver Monitoring System (DMS) is a real-time application designed
-to analyze driver behavior and detect unsafe conditions such as:
+Real-time driver behavior monitoring on a **Raspberry Pi 4 + IR camera**,
+with a desktop GUI for development. Detects:
 
-- Drowsiness
-- Sleeping
-- Face obstruction
-- Smoking
-- Phone usage
+- **Drowsiness** — PERCLOS, yawning, with a per-driver calibrated eye threshold
+- **Sleeping** — sustained eye closure, head-slump fast path, body-pose fallback
+- **Phone distraction** — phone visible **and** head down/away (stock COCO model, no training needed)
+- **Smoking** — custom YOLO11 cigarette model (`models/best.pt`)
+- **Looking away / face obstructed**
 
-The system supports both webcam and video input and displays results
-through a Kivy-based GUI with live overlays and debug metrics.
+Built with Python, OpenCV, **MediaPipe Face Mesh** (replaces dlib — ~10× faster
+on ARM, no 100 MB landmark file), and Ultralytics YOLO with NCNN exports for
+the Pi.
 
----------------------------------------------------------------------
-KEY FEATURES
----------------------------------------------------------------------
+## Architecture
 
-[ FACE-BASED MONITORING ]
-- Face detection and tracking
-- Eye Aspect Ratio (EAR)
-- Mouth Aspect Ratio (MAR)
-- PERCLOS (percentage of eye closure)
-- Head pose / head angle estimation
-- Drowsiness and sleeping detection
+```
+                 ┌────────────────────── every frame ──────────────────────┐
+camera ──► CLAHE ├─► FaceTracker (MediaPipe): EAR/MAR/PERCLOS, pitch/yaw    │
+ (IR ok)         ├─► PoseFallback (YOLO pose) ── only while face is lost   │
+                 └─► ObjectWatch ── scheduled, not per-frame:              │
+                       phone  every 0.7 s   (COCO 'cell phone' class)      │
+                       smoking every 2 s    (best.pt cigarette model)      │
+                                   │
+                                   ▼
+                           Fusion state machine
+                  AWAKE / DROWSY / SLEEPING + distraction flags
+                  (time-based confirmation + hysteresis everywhere)
+                                   │
+                     ┌─────────────┼──────────────┐
+                     ▼             ▼              ▼
+               screen overlay   event log    buzzer (optional,
+               (HDMI / browser) + snapshots   wired later)
+```
 
-[ BODY & POSE FALLBACK ]
-- YOLOv8 pose detection when face is lost
-- Sleeping detection via head tilt
-- Face obstruction detection
+All thresholds live in [config.yaml](config.yaml).
 
-[ SMOKING DETECTION ]
-- YOLO-based smoking detection
-- Grayscale preprocessing for robustness
-- Confidence score output
+## Project layout
 
-[ PHONE USAGE DETECTION ]
-- YOLO-based phone usage detection
+| Path | Purpose |
+|---|---|
+| `dms/` | Core package: capture, face tracking, fusion, detectors, alerts |
+| `web/` | Live dashboard (3D head pose, gaze zones, metrics, event feed) |
+| `app.py` | Desktop GUI (Kivy) — development & threshold tuning |
+| `pi_service.py` | Headless service + web dashboard (`:8080`) |
+| `scripts/eval_video.py` | Run the pipeline over a video, print the state timeline |
+| `scripts/export_ncnn.py` | One-time NCNN export of all models for Pi speed |
+| `deploy/dms.service` | systemd unit to start on boot |
 
-[ USER INTERFACE ]
-- Kivy graphical interface
-- Webcam and video file support
-- Real-time overlays
-- Debug panel with live metrics
+## Dashboard
 
----------------------------------------------------------------------
-PROJECT STRUCTURE
----------------------------------------------------------------------
+`pi_service.py` serves a dashboard at `http://<host>:8080/` (works in any
+browser — phone, laptop, or an HDMI screen on the Pi):
 
-app.py
-|
-+-- modules/
-|    |-- face_tracker.py
-|    |-- body_tracker.py
-|    |-- smoking_detector.py
-|    |-- phone_detector.py
-|
-+-- models/       
-+-- videos/
-+-- README.md
+- **Live 3D face mesh** — the driver's actual 478 MediaPipe landmarks rendered
+  as a point-cloud with eye/lip/oval contours, so blinks, yawns, and head
+  turns are real data, not an animation (ghost mannequin when tracking drops)
+- **Gaze zone map** — a windshield grid showing where the driver is looking
+  (ROAD AHEAD / mirrors / PHONE-LAP), green on road, red off road
+- Live camera view, EAR/PERCLOS/MAR gauges with personal thresholds,
+  head angles, phone/cigarette detection chips, scrolling event log
+- Three.js is vendored in `web/` — no internet needed in the car
 
-Each module:
-- Is independent
-- Handles its own preprocessing
-- Returns structured output dictionaries
-- Can be modified without breaking the pipeline
+Bench demo without a camera:
 
----------------------------------------------------------------------
-REQUIREMENTS
----------------------------------------------------------------------
+```bash
+python pi_service.py --video "videos/Driver sleeps for a full minute while driving.mp4"
+```
 
-- Python 3.8+
-- OpenCV
-- Kivy
-- NumPy
-- dlib
-- imutils
-- SciPy
-- ultralytics (YOLOv8)
+## Models (`models/`)
 
----------------------------------------------------------------------
-INSTALLATION
----------------------------------------------------------------------
+| File | Role | Source |
+|---|---|---|
+| `face_landmarker.task` | face/eye/head tracking | [MediaPipe models](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task) (3.6 MB) |
+| `best.pt` | smoking (1 class: cigarette) | your Colab-trained YOLO11m |
+| `yolo11n.pt` | phone (COCO class 67) | [Ultralytics releases](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt) (5.4 MB) |
+| `yolov8n-pose.pt` | body fallback | Ultralytics |
 
-1) Clone the repository
+The runtime automatically prefers a `*_ncnn_model` folder next to each `.pt`
+when present (created by `scripts/export_ncnn.py`).
 
-   git clone https://github.com/hasham-tdl/driver-monitoring-system.git
-   cd driver-monitoring-system
+## Desktop setup (Windows)
 
-2) Create a virtual environment (recommended)
+```bash
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements-desktop.txt
+python app.py                       # GUI
+python scripts/eval_video.py "videos/clip.mp4"   # headless tuning
+```
 
-   conda create -n dms python=3.9
-   conda activate dms
+## Raspberry Pi setup (Pi 4, Raspberry Pi OS Bookworm 64-bit Lite)
 
-3) Install dependencies
+```bash
+sudo apt update
+sudo apt install -y python3-picamera2 python3-opencv python3-pip
+pip install -r requirements-pi.txt --break-system-packages
 
-   pip install opencv-python kivy numpy imutils scipy ultralytics
+# copy models/ (with *_ncnn_model exports) onto the Pi, then:
+python3 pi_service.py               # open http://<pi>:8080/ on your phone
+```
 
-NOTE:
-dlib may require CMake and Visual Studio Build Tools on Windows.
+Start on boot: see [deploy/dms.service](deploy/dms.service).
 
----------------------------------------------------------------------
-MODEL FILES (NOT INCLUDED)
----------------------------------------------------------------------
+**Camera:** OV5647 NoIR "night vision" board (CSI ribbon). Focus the lens at
+driver distance (~50–70 cm) by rotating the barrel. The IR LED pods handle
+night illumination; the whole pipeline runs on CLAHE-enhanced grayscale, so
+day and night frames look alike to the models.
 
-Model weights are NOT included in this repository.
+**Power (demo):** any 15 W+ USB-C power bank runs the Pi 4 + camera for hours.
 
-Place the following files locally:
+## Test footage (`videos/samples/`)
 
-models/
-- shape_predictor_68_face_landmarks.dat
-- yolov8n-pose.pt
-- smoking_model.pt
-- phone_model.pt
+Freely accessible clips pulled from public GitHub repos for detector testing
+(not redistributed here — see `.gitignore`):
 
-Update model paths inside the modules if required.
+| File | Tests | Source |
+|---|---|---|
+| `smoking_test_1..4.mp4` | smoking detector | [Realtime-Smoking-Detection](https://github.com/Paransaik/Realtime-Smoking-Detection), [Smoking-Detection](https://github.com/AarnoStormborn/Smoking-Detection) |
+| `distracted_driving_demo.mp4` | drowsiness, long-run stability | [Distracted-Driver-Detection](https://github.com/HarshineeSriram/Distracted-Driver-Detection) |
+| `driver_action_recognition.mp4` | phone usage, distraction | [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos) |
+| `head_pose_test.mp4` | head angles / gaze zones | [intel-iot-devkit/sample-videos](https://github.com/intel-iot-devkit/sample-videos) |
 
----------------------------------------------------------------------
-RUNNING THE APPLICATION
----------------------------------------------------------------------
+Run any of them: `python scripts/eval_video.py videos/samples/<file>`
+Quickest live phone-detector test: `python app.py` → *Use Webcam* → hold up
+your phone and look down at it for ~3 s.
 
-python app.py
+## How detection works
 
-Controls:
-- Load Video   -> Select an MP4 file
-- Use Webcam   -> Start live camera feed
-- Play / Stop
-- Debug        -> Toggle live metrics overlay
+- **Calibration** — first ~25 s of each session learns the driver's open-eye
+  EAR; threshold = 75th-percentile × 0.75 (clamped). Press *Recalibrate* (GUI)
+  when the driver changes.
+- **DROWSY** — PERCLOS over a rolling 60 s window crosses 0.20 (clears at
+  0.15), or a sustained yawn.
+- **SLEEPING** — eyes closed > 1.5 s, or closed > 0.8 s with the head slumped
+  > 20°; body-pose tilt fallback when the face is hidden. If the face vanishes
+  *while* SLEEPING (head slumps out of view), the state is held for up to 8 s
+  rather than reset.
+- **Phone** — phone seen in ≥3 of the last 5 detector runs **and** head
+  down/away ≥ 1.5 s.
+- **Smoking** — cigarette in ≥2 of the last 4 runs.
+- Every alert appends a row to `runs/events.csv` plus a JPEG snapshot —
+  use these to tune thresholds per test subject.
 
----------------------------------------------------------------------
-DEBUG METRICS
----------------------------------------------------------------------
+## Roadmap
 
-When debug mode is enabled, the following metrics are displayed:
+- [ ] Retrain one 2-class YOLO11n (cigarette + phone) with grayscale/IR
+      augmentation — replaces both detector models, biggest accuracy win
+- [ ] GPIO buzzer + acknowledge button (`BuzzerSink` is already wired for it)
+- [ ] Permanent install power: 12 V→5 V buck + read-only filesystem
 
-- EAR
-- MAR
-- PERCLOS
-- Head Angle
-- Smoking status and confidence
+## Disclaimer
 
-Useful for:
-- Threshold tuning
-- Model validation
-- Research and experimentation
+Research/educational prototype. **Not** certified for safety-critical or
+commercial automotive use.
 
----------------------------------------------------------------------
-LIMITATIONS
----------------------------------------------------------------------
+## My Role
 
-- Performance depends on lighting conditions
-- Smoking detection accuracy depends on training data
-- CPU-only inference may reduce FPS
-- Not certified for commercial automotive deployment
+Solo end-to-end project. Designed the multi-signal fusion state machine, integrated MediaPipe Face Mesh (replacing dlib for ~10× ARM speedup), trained a custom YOLO11 cigarette model in Colab, built the Kivy desktop GUI for threshold tuning, and wrote the live browser dashboard served from the Pi.
 
----------------------------------------------------------------------
-FUTURE IMPROVEMENTS
----------------------------------------------------------------------
+## The Hard Technical Challenge
 
-- Temporal smoothing for smoking detection
-- Mouth ROI cropping before inference
-- Multi-driver support
-- Audio or visual alerts
-- Cloud logging and analytics
-- Embedded / edge deployment
+Running real-time multi-model inference on a Pi 4 (no GPU, 4 GB RAM). Solved by: replacing dlib with MediaPipe (10× faster on ARM, no 100 MB landmark file), scheduling YOLO detectors at sub-frame intervals (phone every 0.7 s, smoke every 2 s in a background thread) instead of per-frame, and exporting all models to NCNN format via `scripts/export_ncnn.py`.
 
----------------------------------------------------------------------
-DISCLAIMER
----------------------------------------------------------------------
+## Constraint
 
-This project is intended for research and educational purposes only.
-It is NOT certified for safety-critical or commercial automotive use.
+Single Raspberry Pi 4 with IR camera, running headless with no internet. All Three.js dependencies are vendored locally so the dashboard works offline in the car.
 
----------------------------------------------------------------------
-AUTHOR
----------------------------------------------------------------------
+## Author
 
-Hasham
-GitHub: https://github.com/hasham-tdl
-
----------------------------------------------------------------------
-ACKNOWLEDGEMENTS
----------------------------------------------------------------------
-
-- OpenCV
-- dlib
-- Kivy
-- Ultralytics YOLO
-- Academic research on Driver Monitoring Systems
-
----------------------------------------------------------------------
-CONTRIBUTIONS
----------------------------------------------------------------------
-
-Contributions are welcome.
-For major changes, please open an issue first.
-
-=====================================================================
-
+Hasham — https://github.com/hasham-tdl
